@@ -9,3 +9,7 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+
+# Old experiment results (kept locally only)
+results_old/
+results_60_20_20/
