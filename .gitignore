@@ -1,0 +1,11 @@
+# CIFAR-10 dataset (downloaded automatically by torchvision)
+data/
+
+# Model weights (too large for GitHub)
+*.pth
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
