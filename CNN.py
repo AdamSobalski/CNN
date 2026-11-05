@@ -24,7 +24,7 @@ from sklearn.metrics import (accuracy_score, precision_score, recall_score, f1_s
 CONFIG = {
     "weight_decay": 0.0,
     "batch_size": 128,
-    "epochs": 30,
+    "epochs": 100,
 }
 # Etap I (E01–E04): porównanie architektur w takich samych warunkach uczenia
 STAGE1_MODELS = ["simple_cnn", "vgg16", "resnet18", "mobilenet_v2"]
@@ -39,6 +39,7 @@ STAGE2_SETTINGS = [
 ]
 # Każdy eksperyment jest powtarzany dla każdego seeda; wyniki podajemy jako średnia ± SD
 SEEDS = [42, 43, 44]
+EARLY_STOPPING_PATIENCE = 3  # stop po tylu kolejnych wzrostach val loss względem poprzedniej epoki
 
 VAL_SIZE = 5000        # 45 000 train + 5 000 validation; oryginalne 10 000 test tylko do oceny końcowej
 SPLIT_SEED = 0         # stały podział, identyczny dla wszystkich eksperymentów
@@ -302,6 +303,8 @@ def train_model(model, splits, criterion, optimizer, config):
     # Podczas treningu używamy tylko train i val; najlepsza epoka wybierana po val accuracy
     history = {"train_loss": [], "val_loss": [], "train_acc": [], "val_acc": []}
     best_acc, best_epoch, best_state = -1.0, 0, None
+    previous_val_loss = None
+    consecutive_increases = 0
 
     start = time.perf_counter()
     for epoch in range(1, config["epochs"] + 1):
@@ -321,6 +324,15 @@ def train_model(model, splits, criterion, optimizer, config):
         print(f"Epoka {epoch:2d}/{config['epochs']} | "
               f"train loss: {train_loss:.4f}, acc: {train_acc:.4f} | "
               f"val loss: {val['loss']:.4f}, acc: {val['acc']:.4f}")
+        if previous_val_loss is not None and val["loss"] > previous_val_loss:
+            consecutive_increases += 1
+        else:
+            consecutive_increases = 0
+        previous_val_loss = val["loss"]
+        if consecutive_increases >= EARLY_STOPPING_PATIENCE:
+            print(f"Early stopping po epoce {epoch}: val loss wzrósł przez "
+                  f"{EARLY_STOPPING_PATIENCE} kolejne epoki.")
+            break
     train_time = time.perf_counter() - start
 
     model.load_state_dict(best_state)
@@ -368,13 +380,14 @@ def config_label(config):
 
 
 def load_histories(config):
-    # Historie uczenia ze wszystkich seedów jako tablice (seedy x epoki)
+    # Średnie porównujemy tylko dla epok wykonanych przez wszystkie seedy.
     histories = []
     for seed in SEEDS:
         path = os.path.join(RESULTS_DIR, make_run_name({**config, "seed": seed}), "run.json")
         with open(path, encoding="utf-8") as f:
             histories.append(json.load(f)["history"])
-    return {k: np.array([h[k] for h in histories]) for k in histories[0]}
+    common_epochs = min(len(h["train_loss"]) for h in histories)
+    return {k: np.array([h[k][:common_epochs] for h in histories]) for k in histories[0]}
 
 
 def plot_accuracy_bars(rows, labels, path, title):
@@ -438,7 +451,7 @@ def plot_cost(rows, path):
     ax1.set_xticks([0.5, 1, 2, 5, 10, 20], labels=["0.5", "1", "2", "5", "10", "20"])
     ax1.set_xlabel("Liczba parametrów [mln] (skala logarytmiczna)")
     ax1.set_ylabel("Accuracy na zbiorze testowym [%]")
-    ax2.set_xlabel(f"Czas treningu ({CONFIG['epochs']} epok) [min]")
+    ax2.set_xlabel(f"Czas treningu (maks. {CONFIG['epochs']} epok) [min]")
     for ax in (ax1, ax2):
         ax.grid(alpha=0.3)
         ax.margins(x=0.2, y=0.15)
@@ -489,7 +502,7 @@ SUMMARY_METRICS = ["val_acc", "test_acc", "test_precision_macro", "test_recall_m
 def make_run_name(config):
     return (f"{config['model']}_{config['optimizer']}_lr{config['lr']}_wd{config['weight_decay']}"
             f"_bs{config['batch_size']}_ep{config['epochs']}_{'aug' if config['augment'] else 'noaug'}"
-            f"_seed{config['seed']}")
+            f"_es{EARLY_STOPPING_PATIENCE}_seed{config['seed']}")
 
 
 def read_results():
