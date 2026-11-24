@@ -24,8 +24,9 @@ from sklearn.metrics import (accuracy_score, precision_score, recall_score, f1_s
 CONFIG = {
     "weight_decay": 0.0,
     "batch_size": 128,
-    "epochs": 30,
+    "epochs": 100,  # maksymalna liczba epok; trening może zakończyć się wcześniej
 }
+EARLY_STOP_PATIENCE = 3  # kolejne wzrosty val loss względem poprzedniej epoki
 # Etap I (E01–E04): porównanie architektur w takich samych warunkach uczenia
 STAGE1_MODELS = ["simple_cnn", "vgg16", "resnet18", "mobilenet_v2"]
 STAGE1_SETTINGS = {"optimizer": "adam", "lr": 0.001, "augment": True}
@@ -43,7 +44,8 @@ SEEDS = [42, 43, 44]
 VAL_SIZE = 5000        # 45 000 train + 5 000 validation; oryginalne 10 000 test tylko do oceny końcowej
 SPLIT_SEED = 0         # stały podział, identyczny dla wszystkich eksperymentów
 DETERMINISTIC = True   # True: powtarzalność (cudnn.deterministic), False: szybciej (cudnn.benchmark)
-RESULTS_DIR = "results"
+# Osobny katalog serii: zachowujemy wyniki i wykresy wcześniejszych treningów.
+RESULTS_DIR = "results_ep100_es3"
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 CLASSES = ["samolot", "auto", "ptak", "kot", "jeleń",
@@ -302,6 +304,8 @@ def train_model(model, splits, criterion, optimizer, config):
     # Podczas treningu używamy tylko train i val; najlepsza epoka wybierana po val accuracy
     history = {"train_loss": [], "val_loss": [], "train_acc": [], "val_acc": []}
     best_acc, best_epoch, best_state = -1.0, 0, None
+    previous_val_loss = None
+    loss_increases = 0
 
     start = time.perf_counter()
     for epoch in range(1, config["epochs"] + 1):
@@ -321,6 +325,16 @@ def train_model(model, splits, criterion, optimizer, config):
         print(f"Epoka {epoch:2d}/{config['epochs']} | "
               f"train loss: {train_loss:.4f}, acc: {train_acc:.4f} | "
               f"val loss: {val['loss']:.4f}, acc: {val['acc']:.4f}")
+        # Monitorujemy walidację: sam spadek lossu treningowego nie wyklucza overfittingu.
+        if previous_val_loss is not None and val["loss"] > previous_val_loss:
+            loss_increases += 1
+        else:
+            loss_increases = 0
+        previous_val_loss = val["loss"]
+        if loss_increases >= EARLY_STOP_PATIENCE:
+            print(f"Early stopping: val loss rośnie przez {EARLY_STOP_PATIENCE} "
+                  f"kolejne epoki. Zatrzymanie po epoce {epoch}.")
+            break
     train_time = time.perf_counter() - start
 
     model.load_state_dict(best_state)
@@ -368,13 +382,14 @@ def config_label(config):
 
 
 def load_histories(config):
-    # Historie uczenia ze wszystkich seedów jako tablice (seedy x epoki)
+    # Wspólne epoki wszystkich seedów: early stopping daje różne długości historii.
     histories = []
     for seed in SEEDS:
         path = os.path.join(RESULTS_DIR, make_run_name({**config, "seed": seed}), "run.json")
         with open(path, encoding="utf-8") as f:
             histories.append(json.load(f)["history"])
-    return {k: np.array([h[k] for h in histories]) for k in histories[0]}
+    common_epochs = min(len(h["train_loss"]) for h in histories)
+    return {k: np.array([h[k][:common_epochs] for h in histories]) for k in histories[0]}
 
 
 def plot_accuracy_bars(rows, labels, path, title):
@@ -417,7 +432,7 @@ def plot_mean_curves(items, path, title, first_color=0):
         ax.grid(alpha=0.3)
     ax1.legend()
     ax2.legend(loc="lower right")
-    fig.suptitle(f"{title} – średnia z {len(SEEDS)} seedów")
+    fig.suptitle(f"{title} – średnia z {len(SEEDS)} seedów (wspólne epoki)")
     fig.tight_layout()
     fig.savefig(path, dpi=150)
     plt.close(fig)
@@ -438,7 +453,7 @@ def plot_cost(rows, path):
     ax1.set_xticks([0.5, 1, 2, 5, 10, 20], labels=["0.5", "1", "2", "5", "10", "20"])
     ax1.set_xlabel("Liczba parametrów [mln] (skala logarytmiczna)")
     ax1.set_ylabel("Accuracy na zbiorze testowym [%]")
-    ax2.set_xlabel(f"Czas treningu ({CONFIG['epochs']} epok) [min]")
+    ax2.set_xlabel(f"Czas treningu (maks. {CONFIG['epochs']} epok, early stopping) [min]")
     for ax in (ax1, ax2):
         ax.grid(alpha=0.3)
         ax.margins(x=0.2, y=0.15)
@@ -581,6 +596,14 @@ def run_experiment(config, splits):
                  for name, fn in [("precision", precision_score), ("recall", recall_score), ("f1", f1_score)]}
     with open(os.path.join(run_dir, "run.json"), "w", encoding="utf-8") as f:
         json.dump({**row, "history": history, "per_class": per_class,
+                   "epochs_completed": len(history["train_loss"]),
+                   "early_stop_patience": EARLY_STOP_PATIENCE,
+                   "stop_reason": ("consecutive_val_loss_increases"
+                                   if len(history["val_loss"]) > EARLY_STOP_PATIENCE
+                                   and all(b > a for a, b in zip(
+                                       history["val_loss"][-EARLY_STOP_PATIENCE - 1:-1],
+                                       history["val_loss"][-EARLY_STOP_PATIENCE:]))
+                                   else "max_epochs"),
                    "confusion_matrix": confusion_matrix(test["y_true"], test["y_pred"]).tolist()},
                   f, indent=2, ensure_ascii=False)
     save_result(row)
